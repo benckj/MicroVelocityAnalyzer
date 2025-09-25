@@ -1,10 +1,12 @@
 import argparse
 import os
 import pickle
+import copy
 import numpy as np
 import csv
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Dict, List, Tuple, Optional, Union
 
 def process_chunk_balances(args):
     addresses, accounts_chunk, min_block_number, max_block_number, save_every_n, LIMIT, pos = args
@@ -36,34 +38,39 @@ def process_chunk_balances(args):
     return results
 
 def process_chunk_balances_v2(args):
+    """Process balance chunks with corrected sweep logic."""
     addresses, accounts_chunk, min_block_number, max_block_number, save_every_n, LIMIT, pos = args
     
-    save_block_numbers = [min_block_number + i * save_every_n for i in range(LIMIT)]
-
+    save_block_numbers = np.arange(LIMIT, dtype=np.int64) * save_every_n + min_block_number
     results = {}
 
     for address in tqdm(addresses, position=pos, leave=False):
-        current_balance = 0.0
-        block_numbers = set(accounts_chunk[address][0].keys()).union(set(accounts_chunk[address][1].keys()))
-        block_numbers = sorted(block_numbers)
-
-        balances = np.zeros(len(save_block_numbers), dtype=np.float64)
-        for block in block_numbers:
-            if block in accounts_chunk[address][0]:
-                current_balance += accounts_chunk[address][0][block]
-            if block in accounts_chunk[address][1]:
-                current_balance -= accounts_chunk[address][1][block]
-            idx = (block - min_block_number) // save_every_n + 1
-            if idx < len(balances):
-                balances[idx] = current_balance
+        # Collect all balance changes
+        balance_changes = []
+        for block_number, amount in accounts_chunk[address][0].items():
+            balance_changes.append((int(block_number), float(amount)))
+        for block_number, amount in accounts_chunk[address][1].items():
+            balance_changes.append((int(block_number), -float(amount)))
+        # Sort the balance changes by block number
+        balance_changes.sort()
+        
+        # Build combined, sorted changes (+assets, -liabilities), then sweep
+        balance = 0.0
+        change_idx = 0
+        balances = np.zeros(LIMIT, dtype=np.float64)
+        
+        for i, bn in enumerate(save_block_numbers):
+            while change_idx < len(balance_changes) and balance_changes[change_idx][0] <= bn:
+                balance += balance_changes[change_idx][1]
+                change_idx += 1
+            balances[i] = balance
 
         results[address] = balances
-        del balances
     
     return results
 
 def process_chunk_velocities(args):
-    addresses, accounts_chunk, min_block_number, save_every_n, LIMIT, pos = args
+    addresses, accounts_chunk, min_block_number, save_every_n, LIMIT, pos, normalize_velocities, total_supply, balances_chunk = args
     results = {}
     for address in tqdm(addresses, position=pos, leave=False):
         if len(accounts_chunk[address][0]) > 0 and len(accounts_chunk[address][1]) > 0:
@@ -89,7 +96,15 @@ def process_chunk_velocities(args):
                         else:
                             duration = border - counter
                             if duration > 0:
-                                ind_velocity[idx_range[1:]] += liability_amount / duration
+                                added = liability_amount / duration
+                                # Apply normalization if enabled
+                                if normalize_velocities == 'by_balance':
+                                    denom = np.maximum(1e-12, balances_chunk[address][idx_range[1:]])
+                                    added = added / denom
+                                elif normalize_velocities == 'by_supply':
+                                    denom = max(1e-12, total_supply)
+                                    added = added / denom
+                                ind_velocity[idx_range[1:]] += added
                             accounts_chunk[address][0][counter] -= liability_amount
                             accounts_chunk[address][1].pop(border)
                             break
@@ -101,15 +116,46 @@ def process_chunk_velocities(args):
                         else:
                             duration = border - counter
                             if duration > 0:
-                                ind_velocity[idx_range[1:]] += asset_amount / duration
+                                added = asset_amount / duration
+                                # Apply normalization if enabled
+                                if normalize_velocities == 'by_balance':
+                                    denom = np.maximum(1e-12, balances_chunk[address][idx_range[1:]])
+                                    added = added / denom
+                                elif normalize_velocities == 'by_supply':
+                                    denom = max(1e-12, total_supply)
+                                    added = added / denom
+                                ind_velocity[idx_range[1:]] += added
                             accounts_chunk[address][1][border] -= asset_amount
                             accounts_chunk[address][0].pop(counter)
             results[address] = ind_velocity
     return results
 
 class MicroVelocityAnalyzer:
-    def __init__(self, allocated_file, transfers_file, output_file='temp/general_velocities.pickle', save_every_n=1, n_cores=1, n_chunks=1, 
-                 split_save=False, batch_size=1):
+    def __init__(self, allocated_file: str, transfers_file: str, output_file: str = 'temp/general_velocities.pickle', 
+                 save_every_n: int = 1, n_cores: int = 1, n_chunks: int = 1, 
+                 split_save: bool = False, batch_size: int = 1, 
+                 normalize_velocities: str = 'none', total_supply: Optional[float] = None):
+        """Initialize MicroVelocityAnalyzer with optional velocity normalization.
+        
+        Args:
+            allocated_file: Path to allocated CSV file
+            transfers_file: Path to transfers CSV file
+            output_file: Path to output pickle file
+            save_every_n: Save every Nth position of the velocity array
+            n_cores: Number of cores to use
+            n_chunks: Number of chunks to split data into
+            split_save: Split save into different files
+            batch_size: Number of chunks to process in a single batch
+            normalize_velocities: Normalization mode ('none', 'by_balance', 'by_supply')
+            total_supply: Total supply for 'by_supply' normalization
+        """
+        if save_every_n <= 0:
+            raise ValueError("save_every_n must be positive")
+        
+        if normalize_velocities == 'by_supply':
+            if total_supply is None or total_supply <= 0:
+                raise ValueError("total_supply must be provided and positive when normalize_velocities='by_supply'")
+        
         self.allocated_file = allocated_file
         self.transfers_file = transfers_file
         self.output_file = output_file
@@ -118,12 +164,15 @@ class MicroVelocityAnalyzer:
         self.n_chunks = n_chunks
         self.split_save = split_save
         self.batch_size = batch_size
-        self.accounts = {}
-        self.backup_accounts = {}
+        self.normalize_velocities = normalize_velocities
+        self.total_supply = total_supply if total_supply is not None else 0.0
+        
+        self.accounts: Dict[str, List[Dict[int, float]]] = {}
+        self.backup_accounts: Dict[str, List[Dict[int, float]]] = {}
         self.min_block_number = float('inf')
         self.max_block_number = float('-inf')
-        self.velocities = {}
-        self.balances = {}
+        self.velocities: Dict[str, np.ndarray] = {}
+        self.balances: Dict[str, np.ndarray] = {}
         self.LIMIT = 0
         self._create_output_folder()
 
@@ -138,7 +187,8 @@ class MicroVelocityAnalyzer:
             for line in tqdm(reader):
                 self._process_allocation(line)
 
-    def _process_allocation(self, line):
+    def _process_allocation(self, line: Dict[str, str]) -> None:
+        """Process a single allocation line from CSV."""
         to_address = line['to_address'].lower()
         try:
             amount = float(line['amount'])  # Use float
@@ -164,7 +214,8 @@ class MicroVelocityAnalyzer:
             for line in tqdm(reader):
                 self._process_transfer(line)
 
-    def _process_transfer(self, line):
+    def _process_transfer(self, line: Dict[str, str]) -> None:
+        """Process a single transfer line from CSV."""
         from_address = line['from_address'].lower()
         to_address = line['to_address'].lower()
         try:
@@ -299,9 +350,10 @@ class MicroVelocityAnalyzer:
                     if self.split_save:
                         last_address = current_batch[-1][-1]
                         self._save_split_results(batch_results, 'balances', last_address)
-                        batch_results = {}
                     else:
                         self.balances.update(batch_results)
+                    
+                    batch_results = {}
                     
                     del futures
 
@@ -324,8 +376,14 @@ class MicroVelocityAnalyzer:
                     
                     for i, chunk in enumerate(current_batch):
                         accounts_chunk = {address: self.accounts[address] for address in chunk}
+                        # Pass normalization parameters and balances chunk if needed
+                        balances_chunk = {}
+                        if self.normalize_velocities == 'by_balance':
+                            balances_chunk = {address: self.balances[address] for address in chunk if address in self.balances}
+                        
                         args = (chunk, accounts_chunk, self.min_block_number, 
-                               self.save_every_n, self.LIMIT, i + 1)
+                               self.save_every_n, self.LIMIT, i + 1, 
+                               self.normalize_velocities, self.total_supply, balances_chunk)
                         futures.append(executor.submit(process_chunk_velocities, args))
                     
                     for future in as_completed(futures):
@@ -337,9 +395,10 @@ class MicroVelocityAnalyzer:
                     if self.split_save:
                         last_address = current_batch[-1][-1]
                         self._save_split_results(batch_results, 'velocities', last_address)
-                        batch_results = {}
                     else:
                         self.velocities.update(batch_results)
+                    
+                    batch_results = {}
                     
                     del futures
 
@@ -348,7 +407,8 @@ class MicroVelocityAnalyzer:
             if len(self.accounts[address][0]) > 0 and len(self.accounts[address][1]) > 0:
                 self._calculate_individual_velocity(address)
 
-    def _calculate_individual_velocity(self, address):
+    def _calculate_individual_velocity(self, address: str) -> None:
+        """Calculate individual velocity for a single address with optional normalization."""
         arranged_keys = [list(self.accounts[address][0].keys()), list(self.accounts[address][1].keys())]
         arranged_keys[0].sort()
         arranged_keys[1].sort()
@@ -371,7 +431,15 @@ class MicroVelocityAnalyzer:
                     else:
                         duration = border - counter
                         if duration > 0:
-                            ind_velocity[idx_range[1:]] += liability_amount / duration
+                            added = liability_amount / duration
+                            # Apply normalization if enabled
+                            if self.normalize_velocities == 'by_balance':
+                                denom = np.maximum(1e-12, self.balances[address][idx_range[1:]])
+                                added = added / denom
+                            elif self.normalize_velocities == 'by_supply':
+                                denom = max(1e-12, self.total_supply)
+                                added = added / denom
+                            ind_velocity[idx_range[1:]] += added
                         self.accounts[address][0][counter] -= liability_amount
                         self.accounts[address][1].pop(border)
                         break
@@ -383,7 +451,15 @@ class MicroVelocityAnalyzer:
                     else:
                         duration = border - counter
                         if duration > 0:
-                            ind_velocity[idx_range[1:]] += asset_amount / duration
+                            added = asset_amount / duration
+                            # Apply normalization if enabled
+                            if self.normalize_velocities == 'by_balance':
+                                denom = np.maximum(1e-12, self.balances[address][idx_range[1:]])
+                                added = added / denom
+                            elif self.normalize_velocities == 'by_supply':
+                                denom = max(1e-12, self.total_supply)
+                                added = added / denom
+                            ind_velocity[idx_range[1:]] += added
                         self.accounts[address][1][border] -= asset_amount
                         self.accounts[address][0].pop(counter)
         self.velocities[address] = ind_velocity
@@ -422,7 +498,8 @@ class MicroVelocityAnalyzer:
         print(f"Min block number: {self.min_block_number}")
         print(f"Max block number: {self.max_block_number}")
         self.LIMIT = (self.max_block_number - self.min_block_number)//self.save_every_n + 1
-        self.backup_accounts = self.accounts.copy()
+        # Deep copy the backup before any velocity calculations
+        self.backup_accounts = copy.deepcopy(self.accounts)
         print(f"Number of blocks considered: {self.LIMIT}")
         print("Calculating balances...")
         if self.n_cores == 1:
@@ -438,15 +515,30 @@ class MicroVelocityAnalyzer:
         print("Done!")
 
 def main():
-    parser = argparse.ArgumentParser(description='Micro Velocity Analyzer')
-    parser.add_argument('--allocated_file', type=str, default='sampledata/sample_allocated.csv', help='Path to the allocated CSV file')
-    parser.add_argument('--transfers_file', type=str, default='sampledata/sample_transfers.csv', help='Path to the transfers CSV file')
-    parser.add_argument('--output_file', type=str, default='sampledata/general_velocities.pickle', help='Path to the output file')
-    parser.add_argument('--save_every_n', type=int, default=1, help='Save every Nth position of the velocity array')
-    parser.add_argument('--n_cores', type=int, default=1, help='Number of cores to use')
-    parser.add_argument('--n_chunks', type=int, default=1, help='Number of chunks to split the data into (must be >= n_cores)')
-    parser.add_argument('--split_save', action='store_true', default=False, help='Split the save into different files')
-    parser.add_argument('--batch_size', type=int, default=1, help='Number of chunks to process in a single batch')
+    parser = argparse.ArgumentParser(description='Micro Velocity Analyzer with optional velocity normalization')
+    parser.add_argument('--allocated_file', type=str, default='sampledata/sample_allocated.csv', 
+                       help='Path to the allocated CSV file')
+    parser.add_argument('--transfers_file', type=str, default='sampledata/sample_transfers.csv', 
+                       help='Path to the transfers CSV file')
+    parser.add_argument('--output_file', type=str, default='sampledata/general_velocities.pickle', 
+                       help='Path to the output file')
+    parser.add_argument('--save_every_n', type=int, default=1, 
+                       help='Save every Nth position of the velocity array (must be positive)')
+    parser.add_argument('--n_cores', type=int, default=1, 
+                       help='Number of cores to use')
+    parser.add_argument('--n_chunks', type=int, default=1, 
+                       help='Number of chunks to split the data into (must be >= n_cores)')
+    parser.add_argument('--split_save', action='store_true', default=False, 
+                       help='Split the save into different files')
+    parser.add_argument('--batch_size', type=int, default=1, 
+                       help='Number of chunks to process in a single batch')
+    parser.add_argument('--normalize_velocities', type=str, default='none', 
+                       choices=['none', 'by_balance', 'by_supply'],
+                       help='Velocity normalization mode: none (default, absolute velocities), '
+                            'by_balance (normalize by account balance), '
+                            'by_supply (normalize by total supply)')
+    parser.add_argument('--total_supply', type=float, default=None,
+                       help='Total supply for by_supply normalization (required when normalize_velocities=by_supply)')
     args = parser.parse_args()
 
     analyzer = MicroVelocityAnalyzer(
@@ -457,7 +549,9 @@ def main():
         n_cores=args.n_cores,
         n_chunks=args.n_chunks,
         split_save=args.split_save,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        normalize_velocities=args.normalize_velocities,
+        total_supply=args.total_supply
     )
     analyzer.run_analysis()
 
